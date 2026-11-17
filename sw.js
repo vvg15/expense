@@ -3,7 +3,7 @@
 // Phones only notice an update when THIS file's bytes change, so the release
 // version is written here as well as in version.js. Use `python3 bump_version.py X.Y.Z`
 // to change both at once.
-const RELEASE = '1.0.0';
+const RELEASE = '1.1.1';
 
 importScripts('version.js');
 if (self.APP_VERSION !== RELEASE) console.warn(`Version mismatch: sw.js=${RELEASE}, version.js=${self.APP_VERSION}`);
@@ -20,6 +20,8 @@ const ASSETS = [
   'js/schema.js',
   'js/recurring.js',
   'js/util.js',
+  'js/sms.js',
+  'js/sms-rules.js',
   'icons/icon-192.png',
   'icons/icon-512.png',
   'icons/maskable-512.png',

@@ -4,6 +4,8 @@ import {
   buildBackup, parseImportText, toCSV,
 } from './schema.js';
 import { generateDue, nextDue, describe, monthlyEquivalent, occurrences } from './recurring.js';
+import { parseSmsBackup, analyze as analyzeSms, merchantKey } from './sms.js';
+import { defaultSmsSettings } from './sms-rules.js';
 import { pad, ymOf, isoDate, todayIso, parseIso, daysIn, shiftMonth, monthName, prettyDate, esc, uid, parseAmount, addDays } from './util.js';
 
 const APP_VERSION = self.APP_VERSION || 'dev';
@@ -38,12 +40,13 @@ const $ = (id) => document.getElementById(id);
 const fmtCache = {};
 function locale() { return (CURRENCIES.find((c) => c[0] === state.settings.currency) || CURRENCIES[0])[2]; }
 function money(n, compact) {
-  const key = state.settings.currency + (compact ? 'c' : '');
+  const frac = !compact && Math.round(Math.abs(n || 0) * 100) % 100 !== 0;
+  const key = state.settings.currency + (compact ? 'c' : frac ? 'f' : '');
   if (!fmtCache[key]) {
     try {
       fmtCache[key] = new Intl.NumberFormat(locale(), compact
         ? { style: 'currency', currency: state.settings.currency, notation: 'compact', maximumFractionDigits: 1 }
-        : { style: 'currency', currency: state.settings.currency, minimumFractionDigits: 0, maximumFractionDigits: 2 });
+        : { style: 'currency', currency: state.settings.currency, minimumFractionDigits: frac ? 2 : 0, maximumFractionDigits: frac ? 2 : 0 });
     } catch { fmtCache[key] = { format: (v) => `${state.settings.currency} ${Number(v).toFixed(2)}` }; }
   }
   return fmtCache[key].format(n || 0);
@@ -235,10 +238,12 @@ $('checkUpdate').addEventListener('click', async () => {
 // ─── Routing ─────────────────────────────────────────────────────────────────
 function route() {
   const v = (location.hash || '#home').slice(1);
-  state.view = ['home', 'recurring', 'settings'].includes(v) ? v : 'home';
-  ['home', 'recurring', 'settings'].forEach((n) => ($('view-' + n).hidden = n !== state.view));
-  document.querySelectorAll('.tabbar a').forEach((a) => a.classList.toggle('active', a.dataset.tab === state.view));
-  $('fab').hidden = state.view === 'settings';
+  state.view = ['home', 'recurring', 'settings', 'sms'].includes(v) ? v : 'home';
+  ['home', 'recurring', 'settings', 'sms'].forEach((n) => ($('view-' + n).hidden = n !== state.view));
+  const tab = state.view === 'sms' ? 'settings' : state.view;
+  document.querySelectorAll('.tabbar a').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab));
+  $('fab').hidden = state.view === 'settings' || state.view === 'sms';
+  updateSmsBar();
   $('fab').setAttribute('aria-label', state.view === 'recurring' ? 'Add recurring payment' : 'Add expense');
   window.scrollTo(0, 0);
 }
@@ -251,6 +256,7 @@ function renderAll() {
   if (state.view === 'home') renderHome();
   if (state.view === 'recurring') renderRecurring();
   if (state.view === 'settings') renderSettings();
+  if (state.view === 'sms') renderSms();
 }
 
 const monthExpenses = (ym) => state.expenses.filter((e) => e.date.startsWith(ym));
@@ -722,7 +728,7 @@ $('shareJson').addEventListener('click', async () => {
   catch (e) { if (e && e.name !== 'AbortError') toast('Sharing isn’t available — use Export instead'); }
 });
 $('exportCsv').addEventListener('click', () => {
-  if (!state.expenses.length) { toast('No expenses to export yet'); return; }
+  if (!state.expenses.length && !state.rules.length) { toast('Nothing to export yet'); return; }
   downloadBlob(new Blob([toCSV(state.expenses, state.settings.currency, state.rules)], { type: 'text/csv' }), `expenses_${stamp()}.csv`);
   toast('Spreadsheet saved to Downloads');
 });
@@ -810,6 +816,240 @@ $('wipeBtn').addEventListener('click', async () => {
     resetFormats(); renderAll(); toast('All data deleted');
   } catch (e) { toast('Couldn’t delete: ' + e.message); }
 });
+
+
+// ─── Import from SMS ─────────────────────────────────────────────────────────
+const sms = { messages: null, fileName: '', items: [], skipped: null, unread: [], inRange: 0, scanned: false, preset: 'this' };
+const smsCfg = () => state.settings.sms || (state.settings.sms = defaultSmsSettings());
+
+function setPreset(p) {
+  const t = new Date(), today = todayIso();
+  let from = today, to = today;
+  if (p === '7d') from = addDays(today, -6);
+  else if (p === 'this') from = ymOf(t) + '-01';
+  else if (p === 'last') { const lm = shiftMonth(ymOf(t), -1); from = lm + '-01'; to = `${lm}-${pad(daysIn(lm))}`; }
+  else if (p === '3m') from = shiftMonth(ymOf(t), -2) + '-01';
+  sms.preset = p;
+  $('smsFrom').value = from; $('smsTo').value = to;
+  document.querySelectorAll('#smsPresets .chip').forEach((c) => c.classList.toggle('selected', c.dataset.preset === p));
+}
+
+function renderSms() {
+  if (!$('smsFrom').value) setPreset(sms.preset);
+  if (sms.messages) {
+    const first = sms.messages[0].ts, last = sms.messages[sms.messages.length - 1].ts;
+    $('smsFileInfo').textContent = `✓ ${sms.fileName} · ${sms.messages.length.toLocaleString('en-IN')} messages · ${prettyDate(isoDate(new Date(first)))} – ${prettyDate(isoDate(new Date(last)))}`;
+  } else $('smsFileInfo').textContent = '';
+  $('smsScan').disabled = !sms.messages;
+  renderSmsCustom();
+}
+
+function catOptions(selected) {
+  const names = state.settings.categories.map((c) => c.name);
+  if (selected && !names.includes(selected)) names.push(selected);
+  return names.map((n) => `<option ${n === selected ? 'selected' : ''}>${esc(n)}</option>`).join('');
+}
+
+function renderSmsResults() {
+  $('smsResults').hidden = !sms.scanned;
+  if (!sms.scanned) { updateSmsBar(); return; }
+  const k = sms.skipped;
+  const total = sms.items.length;
+  const parts = [];
+  if (k.imported) parts.push(`${k.imported} already imported`);
+  if (k.income) parts.push(`${k.income} money received`);
+  if (k.otp) parts.push(`${k.otp} OTP`);
+  if (k.notPayment) parts.push(`${k.notPayment} reminders/failed`);
+  if (k.filtered) parts.push(`${k.filtered} skipped by your settings`);
+  $('smsStats').innerHTML = `Checked <b>${sms.inRange.toLocaleString('en-IN')}</b> messages from ${esc(prettyDate($('smsFrom').value))} to ${esc(prettyDate($('smsTo').value))}. Found <b>${total}</b> payment${total === 1 ? '' : 's'}.`
+    + (parts.length ? `<br><span class="muted">Ignored: ${esc(parts.join(' · '))}.</span>` : '')
+    + (total ? `<br><span class="muted">Untick anything you don’t want, and fix details before adding.</span>` : '');
+
+  if (!total) {
+    $('smsList').innerHTML = `<div class="empty">No new payments found in these dates.${k.imported ? ' Everything here has already been imported.' : ''}</div>`;
+  } else {
+    $('smsList').innerHTML = sms.items.map((it, i) => {
+      const badges = [];
+      if (it.flags.includes('dup')) badges.push('<span class="badge warn">Looks like a duplicate of another SMS</span>');
+      if (it.flags.includes('exists')) badges.push(`<span class="badge warn">You may have added this already${it.twin ? ': “' + esc(it.twin) + '”' : ''}</span>`);
+      if (it.flags.includes('self')) badges.push('<span class="badge warn">Looks like a transfer to your own account</span>');
+      if (it.flags.includes('atm')) badges.push('<span class="badge">ATM cash withdrawal</span>');
+      if (it.category !== it.suggested) badges.push('<span class="badge info">Category changed</span>');
+      return `<div class="sms-item ${it.selected ? '' : 'off'}" data-i="${i}">
+        <input type="checkbox" data-f="selected" ${it.selected ? 'checked' : ''} aria-label="Include this payment">
+        <div class="sms-main">
+          <div class="sms-row1">
+            <input class="sms-amt num" data-f="amount" inputmode="decimal" value="${it.amount}" aria-label="Amount">
+            <select data-f="category" aria-label="Category">${catOptions(it.category)}</select>
+          </div>
+          <input data-f="merchant" value="${esc(it.merchant)}" placeholder="Note (who you paid)" maxlength="120" aria-label="Note">
+          <div class="sms-row3">
+            <input type="date" data-f="date" value="${it.date}" aria-label="Date">
+            <select data-f="method" aria-label="Paid with">${methodOptions(it.method)}</select>
+            <button type="button" class="linkish sms-show" data-show>View SMS</button>
+          </div>
+          <div class="sms-meta"><span>From ${esc(it.sender)}</span>${badges.join('')}</div>
+          <pre class="sms-body" hidden>${esc(it.body)}</pre>
+        </div>
+      </div>`;
+    }).join('');
+  }
+  $('smsUnread').innerHTML = sms.unread.length
+    ? `<details class="sms-unread"><summary><span><b>${sms.unread.length}</b> payment message${sms.unread.length === 1 ? '' : 's'} couldn’t be read <span class="muted">(no amount found)</span></span></summary>
+        ${sms.unread.slice(0, 50).map((u, i) => `<div style="margin-top:10px"><div class="sms-meta"><span>${esc(prettyDate(u.date))} · ${esc(u.address)}</span><button type="button" class="linkish" data-add-unread="${i}">Add manually</button></div><pre class="sms-body">${esc(u.body)}</pre></div>`).join('')}
+      </details>` : '';
+  updateSmsBar();
+}
+
+function updateSmsBar() {
+  const on = !!(state.view === 'sms' && sms.scanned && sms.items.length);
+  $('smsBar').hidden = !on;
+  document.body.classList.toggle('has-smsbar', on);
+  if (!on) return;
+  const sel = sms.items.filter((x) => x.selected && x.amount > 0);
+  $('smsSel').innerHTML = `<b>${sel.length}</b> of ${sms.items.length} selected · <b class="num">${money(sum(sel))}</b>`;
+  $('smsAdd').textContent = `Add ${sel.length} expense${sel.length === 1 ? '' : 's'}`;
+  $('smsAdd').disabled = !sel.length;
+  $('smsToggleAll').textContent = sel.length === sms.items.length ? 'Select none' : 'Select all';
+}
+
+$('smsPick').addEventListener('click', () => { $('smsFile').value = ''; $('smsFile').click(); });
+$('smsFile').addEventListener('change', async (e) => {
+  const f = e.target.files && e.target.files[0]; if (!f) return;
+  $('smsFileInfo').textContent = 'Reading…';
+  try {
+    sms.messages = parseSmsBackup(await f.text());
+    sms.fileName = f.name;
+    sms.scanned = false; sms.items = [];
+    renderSms(); renderSmsResults();
+    toast(`Loaded ${sms.messages.length.toLocaleString('en-IN')} messages`);
+  } catch (err) {
+    sms.messages = null; renderSms();
+    await dialog({ title: 'Can’t read this file', html: `<p>${esc(err.message)}</p>` });
+  }
+});
+$('smsPresets').addEventListener('click', (e) => { const b = e.target.closest('[data-preset]'); if (b) setPreset(b.dataset.preset); });
+['smsFrom', 'smsTo'].forEach((id) => $(id).addEventListener('input', () => { sms.preset = 'custom'; document.querySelectorAll('#smsPresets .chip').forEach((c) => c.classList.remove('selected')); }));
+
+$('smsScan').addEventListener('click', () => {
+  const from = $('smsFrom').value, to = $('smsTo').value;
+  if (!from || !to) { toast('Choose both dates'); return; }
+  if (from > to) { toast('“From” is after “To”'); return; }
+  const r = analyzeSms(sms.messages, { from, to, cfg: smsCfg(), existing: state.expenses });
+  Object.assign(sms, r, { scanned: true });
+  renderSmsResults();
+  $('smsResults').scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+
+$('smsList').addEventListener('input', (e) => {
+  const row = e.target.closest('[data-i]'); const f = e.target.dataset.f; if (!row || !f) return;
+  const it = sms.items[Number(row.dataset.i)];
+  if (f === 'selected') { it.selected = e.target.checked; row.classList.toggle('off', !it.selected); }
+  else if (f === 'amount') it.amount = parseAmount(e.target.value);
+  else it[f] = e.target.value;
+  if (f === 'category') renderSmsResults(); else updateSmsBar();
+});
+$('smsList').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-show]'); if (!b) return;
+  const pre = b.closest('.sms-main').querySelector('.sms-body');
+  pre.hidden = !pre.hidden; b.textContent = pre.hidden ? 'View SMS' : 'Hide SMS';
+});
+$('smsUnread').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-add-unread]'); if (!b) return;
+  const u = sms.unread[Number(b.dataset.addUnread)];
+  openExpense(null);
+  $('fDate').value = u.date;
+});
+$('smsToggleAll').addEventListener('click', () => {
+  const all = sms.items.every((x) => x.selected);
+  sms.items.forEach((x) => (x.selected = !all));
+  renderSmsResults();
+});
+
+$('smsAdd').addEventListener('click', async () => {
+  const chosen = sms.items.filter((x) => x.selected && x.amount > 0 && /^\d{4}-\d{2}-\d{2}$/.test(x.date));
+  if (!chosen.length) return;
+  const now = Date.now();
+  const expenses = chosen.map((x) => normalizeExpense({
+    id: x.key, amount: x.amount, date: x.date, category: x.category, method: x.method,
+    note: (x.merchant || '').trim(), source: 'sms', smsSender: x.sender, createdAt: now, updatedAt: now,
+  })).filter(Boolean);
+
+  // Learn: a changed category becomes a rule for that merchant.
+  const cfg = smsCfg();
+  let learned = 0;
+  if (cfg.learn) {
+    chosen.forEach((x) => {
+      const k = merchantKey(x.merchant);
+      if (!k || k.length < 3 || x.category === x.suggested || x.atm) return;
+      cfg.rules = cfg.rules.filter((r) => r.k !== k);
+      cfg.rules.unshift({ k, c: x.category, mine: true });
+      learned++;
+    });
+  }
+  if (!(await persist({ expenses, meta: { settings: state.settings } }))) return;
+  upsertLocal('expenses', expenses);
+  addMissingCategories(expenses.map((x) => x.category));
+  const added = new Set(chosen.map((x) => x.key));
+  sms.items = sms.items.filter((x) => !added.has(x.key));
+  sms.skipped.imported += added.size;
+  renderSmsResults(); renderSmsCustom();
+  toast(`Added ${expenses.length} expense${expenses.length === 1 ? '' : 's'} (${money(sum(expenses))})${learned ? ` · learned ${learned} rule${learned === 1 ? '' : 's'}` : ''}`);
+});
+
+// ── Customisation ──
+function renderSmsCustom() {
+  const cfg = smsCfg();
+  $('ruleCat').innerHTML = catOptions($('ruleCat').value || state.settings.categories[0]?.name);
+  $('smsDefCat').innerHTML = catOptions(cfg.defaultCategory);
+  $('smsDefMethod').innerHTML = methodOptions(cfg.defaultMethod);
+  $('smsLearn').checked = cfg.learn;
+  $('smsSkipPersonal').checked = cfg.skipPersonal;
+  $('smsAtm').checked = cfg.includeAtm;
+  if (document.activeElement !== $('smsIgnore')) $('smsIgnore').value = cfg.ignoreWords.join(', ');
+  if (document.activeElement !== $('smsSkipSenders')) $('smsSkipSenders').value = cfg.skipSenders.join(', ');
+  const q = $('ruleSearch').value.trim().toLowerCase();
+  const groups = new Map();
+  cfg.rules.forEach((r, i) => {
+    if (q && !r.k.includes(q) && !r.c.toLowerCase().includes(q)) return;
+    if (!groups.has(r.c)) groups.set(r.c, []);
+    groups.get(r.c).push({ ...r, i });
+  });
+  $('ruleGroups').innerHTML = groups.size ? [...groups.entries()].map(([c, rs]) => `
+    <div class="rule-group"><div class="rule-group-name"><span class="dot" style="background:${catColor(c)}"></span>${esc(c)} <span class="muted small">(${rs.length})</span></div>
+    <div class="rule-chips">${rs.map((r) => `<span class="rule-chip ${r.mine ? 'mine' : ''}">${esc(r.k)}<button type="button" data-del-rule="${r.i}" aria-label="Remove ${esc(r.k)}">×</button></span>`).join('')}</div></div>`).join('')
+    : `<p class="muted small">${q ? 'No rules match your search.' : 'No rules yet.'}</p>`;
+}
+async function saveSms() { await persist({ meta: { settings: state.settings } }); renderSmsCustom(); }
+const csvList = (v) => v.split(',').map((x) => x.trim()).filter(Boolean);
+
+$('ruleAddForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const k = $('ruleKw').value.trim().toLowerCase().slice(0, 60), c = $('ruleCat').value;
+  if (!k) return;
+  const cfg = smsCfg();
+  cfg.rules = cfg.rules.filter((r) => r.k !== k);
+  cfg.rules.unshift({ k, c, mine: true });
+  $('ruleKw').value = '';
+  saveSms(); toast(`“${k}” → ${c}`);
+});
+$('ruleSearch').addEventListener('input', renderSmsCustom);
+$('ruleGroups').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-del-rule]'); if (!b) return;
+  smsCfg().rules.splice(Number(b.dataset.delRule), 1); saveSms();
+});
+$('ruleReset').addEventListener('click', async () => {
+  const { value } = await dialog({ title: 'Reset category rules?', html: '<p>Your own and learned rules will be removed and the built-in list restored. Other SMS settings stay as they are.</p>', actions: [{ label: 'Cancel', value: false }, { label: 'Reset', value: true, kind: 'danger solid' }] });
+  if (!value) return;
+  smsCfg().rules = defaultSmsSettings().rules; saveSms(); toast('Rules reset');
+});
+$('smsLearn').addEventListener('change', (e) => { smsCfg().learn = e.target.checked; saveSms(); });
+$('smsSkipPersonal').addEventListener('change', (e) => { smsCfg().skipPersonal = e.target.checked; saveSms(); });
+$('smsAtm').addEventListener('change', (e) => { smsCfg().includeAtm = e.target.checked; saveSms(); });
+$('smsDefCat').addEventListener('change', (e) => { smsCfg().defaultCategory = e.target.value; saveSms(); });
+$('smsDefMethod').addEventListener('change', (e) => { smsCfg().defaultMethod = e.target.value; saveSms(); });
+$('smsIgnore').addEventListener('change', (e) => { smsCfg().ignoreWords = csvList(e.target.value); saveSms(); });
+$('smsSkipSenders').addEventListener('change', (e) => { smsCfg().skipSenders = csvList(e.target.value).map((x) => x.toUpperCase()); saveSms(); });
 
 // ─── Global events ───────────────────────────────────────────────────────────
 $('prevMonth').addEventListener('click', () => { state.month = shiftMonth(state.month, -1); renderHome(); });

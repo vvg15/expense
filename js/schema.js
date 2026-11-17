@@ -16,6 +16,7 @@
 // ──────────────────────────────────────────────────────────────────────────────
 
 import { isIsoDate, round2, hash, uid, todayIso } from './util.js';
+import { defaultSmsSettings, normalizeSmsSettings } from './sms-rules.js';
 
 export const SCHEMA_VERSION = 1;
 export const BACKUP_FORMAT = 'expense-manager-backup';
@@ -27,7 +28,7 @@ export const DEFAULT_CATEGORIES = ['Food & dining', 'Groceries', 'Transport', 'R
 export const FREQUENCIES = ['daily', 'weekly', 'monthly', 'yearly'];
 
 export function defaultSettings() {
-  return { currency: 'INR', budget: 0, categories: DEFAULT_CATEGORIES.map((c) => ({ ...c })), methods: DEFAULT_METHODS.slice() };
+  return { currency: 'INR', budget: 0, categories: DEFAULT_CATEGORIES.map((c) => ({ ...c })), methods: DEFAULT_METHODS.slice(), sms: defaultSmsSettings() };
 }
 
 // ─── Migrations ──────────────────────────────────────────────────────────────
@@ -110,6 +111,7 @@ export function normalizeSettings(raw) {
     budget: Math.max(0, round2(num(raw.budget, 0))),
     categories: cats.length ? cats : d.categories,
     methods: methods.length ? methods : d.methods,
+    sms: normalizeSmsSettings(raw.sms), // optional (added in app 1.1.0) — no migration needed
   };
 }
 
@@ -159,14 +161,19 @@ function parseBackup(text) {
   };
 }
 
-// ─── CSV ─────────────────────────────────────────────────────────────────────
+// ─── CSV (one spreadsheet: expenses + recurring payments) ─────────────────────
+// Columns are matched by name on import, so adding columns later is safe.
+const FREQ_LABEL = { daily: 'Daily', weekly: 'Weekly', monthly: 'Monthly', yearly: 'Yearly' };
+const CSV_HEADER = 'Type,Date,Category,Amount,Currency,Paid with,Note,Recurring payment,Repeats,Every,Ends,Status,Last added,Id';
+
 export function toCSV(expenses, currency, rules = []) {
-  const ruleName = Object.fromEntries(rules.map((r) => [r.id, r.note || r.category]));
+  const name = Object.fromEntries(rules.map((r) => [r.id, r.note || r.category]));
   const q = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`;
-  const rows = expenses.slice().sort((a, b) => a.date.localeCompare(b.date));
-  return '﻿' + ['Date,Category,Amount,Currency,Paid with,Note,Recurring']
-    .concat(rows.map((e) => [e.date, q(e.category), e.amount, currency, q(e.method), q(e.note), q(e.recurringId ? (ruleName[e.recurringId] || 'Yes') : '')].join(',')))
-    .join('\n');
+  const exp = expenses.slice().sort((a, b) => a.date.localeCompare(b.date)).map((e) =>
+    ['Expense', e.date, q(e.category), e.amount, currency, q(e.method), q(e.note), q(e.recurringId ? (name[e.recurringId] || 'Yes') : ''), '', '', '', '', '', q(e.id)].join(','));
+  const rec = rules.map((r) =>
+    ['Recurring', r.startDate, q(r.category), r.amount, currency, q(r.method), q(r.note), '', FREQ_LABEL[r.frequency], r.interval, r.endDate || '', r.active ? 'Active' : 'Paused', r.lastGenerated || '', q(r.id)].join(','));
+  return '﻿' + [CSV_HEADER, ...exp, ...rec].join('\n');
 }
 
 function csvRows(text) {
@@ -204,24 +211,42 @@ function parseCsv(text) {
   if (rows.length < 2) throw new Error('The CSV file has no rows to import.');
   const header = rows[0].map((h) => h.trim().toLowerCase());
   const col = (...names) => header.findIndex((h) => names.includes(h));
-  const iDate = col('date'), iAmt = col('amount'), iCat = col('category'), iMethod = col('paid with', 'method', 'payment method'), iNote = col('note', 'notes', 'description');
-  if (iDate < 0 || iAmt < 0) throw new Error('The CSV needs at least “Date” and “Amount” columns.');
-  const seen = {};
-  const expenses = []; let skipped = 0;
+  const I = {
+    type: col('type'), date: col('date', 'first payment', 'start date'), amt: col('amount'), cat: col('category'),
+    method: col('paid with', 'method', 'payment method'), note: col('note', 'notes', 'description', 'name'),
+    freq: col('repeats', 'frequency'), every: col('every', 'interval'), end: col('ends', 'end date'),
+    status: col('status'), last: col('last added', 'last generated'), id: col('id'),
+  };
+  if (I.date < 0 || I.amt < 0) throw new Error('The CSV needs at least “Date” and “Amount” columns.');
+  const expenses = [], recurring = [], seen = {};
+  let skipped = 0;
   rows.slice(1).forEach((r) => {
-    const date = csvDate(r[iDate]);
-    const amount = round2(String(r[iAmt] || '').replace(/[^\d.]/g, ''));
+    const get = (k) => (I[k] >= 0 ? String(r[I[k]] ?? '').trim() : '');
+    const amount = round2(get('amt').replace(/[^\d.]/g, ''));
+    const date = csvDate(get('date'));
+    const category = get('cat') || 'Other', method = get('method') || 'Other', note = get('note');
+    if (/recurr/i.test(get('type'))) {
+      const freq = get('freq').toLowerCase();
+      const rule = normalizeRule({
+        id: get('id') || 'csvr-' + hash([note, amount, date, freq].join('|')),
+        note, amount, category, method, startDate: date,
+        frequency: FREQUENCIES.includes(freq) ? freq : 'monthly', interval: Number(get('every')) || 1,
+        endDate: csvDate(get('end')), active: !/paus/i.test(get('status')), lastGenerated: csvDate(get('last')),
+      });
+      if (rule) recurring.push(rule); else skipped++;
+      return;
+    }
     if (!date || !(amount > 0)) { skipped++; return; }
-    const category = iCat >= 0 ? (r[iCat] || '').trim() : 'Other';
-    const method = iMethod >= 0 ? (r[iMethod] || '').trim() : 'Other';
-    const note = iNote >= 0 ? (r[iNote] || '').trim() : '';
-    // Same row content → same id, so importing the same CSV twice doesn't duplicate.
+    // No Id column (older files / hand-made sheets): derive one from the row so
+    // importing the same file twice doesn't create duplicates.
     const key = [date, category, amount, method, note].join('|');
     seen[key] = (seen[key] || 0) + 1;
-    expenses.push(normalizeExpense({ id: 'csv-' + hash(key + '#' + seen[key]), date, amount, category: category || 'Other', method: method || 'Other', note }));
+    const id = get('id') || 'csv-' + hash(key + '#' + seen[key]);
+    const e = normalizeExpense({ id, date, amount, category, method, note, recurringId: id.startsWith('rec:') ? id.split(':')[1] : null });
+    if (e) expenses.push(e); else skipped++;
   });
-  if (!expenses.length) throw new Error('No valid rows found in the CSV (check the Date and Amount columns).');
-  return { source: 'csv', fileSchema: null, appVersion: null, exportedAt: null, settings: null, expenses, recurring: [], skipped };
+  if (!expenses.length && !recurring.length) throw new Error('No valid rows found in the CSV (check the Date and Amount columns).');
+  return { source: 'csv', fileSchema: null, appVersion: null, exportedAt: null, settings: null, expenses, recurring, skipped };
 }
 
 export { todayIso };

@@ -74,6 +74,7 @@
     <p class="muted intro">Rent, subscriptions, EMIs, SIPs… Set them once and they’re added to your expenses automatically on each due date.</p>
     <div id="ruleSummary" class="cards cards-2"></div>
     <section class="panel" id="ruleList"></section>
+    <p class="muted small hint">Export or import recurring payments in <a class="linkish" href="#settings">Settings → Backup &amp; restore</a>.</p>
   </section>
 
   <!-- ───────── Settings ───────── -->
@@ -99,6 +100,12 @@
     </section>
 
     <section class="panel">
+      <h2>Import from SMS</h2>
+      <p class="muted small hint" style="margin-top:0">Read bank, UPI and card SMS for the dates you choose. You review every expense before it’s added.</p>
+      <a class="btn primary" href="#sms" style="display:inline-block;margin-top:12px;text-decoration:none">Import from SMS…</a>
+    </section>
+
+    <section class="panel">
       <h2>Backup &amp; restore</h2>
       <p class="muted small hint" id="backupInfo"></p>
       <div class="btn-grid">
@@ -107,7 +114,7 @@
         <button class="btn ghost" id="exportCsv">Export spreadsheet (.csv)</button>
         <button class="btn ghost" id="importBtn">Import file…</button>
       </div>
-      <p class="muted small hint">A <b>.json backup</b> restores everything (expenses, recurring payments, settings) and can be imported by any future version of this app. A <b>.csv</b> opens in Excel or Google Sheets and can also be imported.</p>
+      <p class="muted small hint">A <b>.json backup</b> restores everything (expenses, recurring payments, settings) and can be imported by any future version of this app. The <b>.csv spreadsheet</b> lists all expenses and recurring payments (see the “Type” column), opens in Excel or Google Sheets, and can be imported back.</p>
       <input type="file" id="importFile" accept=".json,.csv,application/json,text/csv,text/comma-separated-values" hidden>
     </section>
 
@@ -128,6 +135,80 @@
       <button class="btn ghost danger" id="wipeBtn">Delete all data…</button>
     </section>
   </section>
+
+  <!-- ───────── SMS import ───────── -->
+  <section id="view-sms" class="view" hidden>
+    <header class="top"><div class="brand"><a href="#settings" class="icon-btn back" aria-label="Back to settings">‹</a><h1>Import from SMS</h1></div></header>
+
+    <section class="panel">
+      <h2>1. Load your messages</h2>
+      <p class="small" style="margin:0 0 10px">Android doesn’t let this app read SMS directly, so first save a copy of your messages:</p>
+      <ol class="steps small">
+        <li>Install the free app <b>SMS Backup &amp; Restore</b> (by SyncTech) from the Play Store.</li>
+        <li>Open it → <b>Back up</b> → turn on <b>Messages</b> only → choose <b>Local backup</b> (on your phone) → <b>Back up now</b>.</li>
+        <li>Come back here and choose that <b>.xml</b> file.</li>
+      </ol>
+      <button class="btn primary" id="smsPick">Choose SMS backup file</button>
+      <p class="small file-info" id="smsFileInfo"></p>
+      <p class="muted small hint">The file is read on your phone only. It isn’t saved or sent anywhere.</p>
+      <input type="file" id="smsFile" accept=".xml,text/xml,application/xml" hidden>
+    </section>
+
+    <section class="panel" id="smsRangePanel">
+      <h2>2. Choose dates</h2>
+      <div class="chips" id="smsPresets">
+        <button type="button" class="chip" data-preset="7d">Last 7 days</button>
+        <button type="button" class="chip" data-preset="this">This month</button>
+        <button type="button" class="chip" data-preset="last">Last month</button>
+        <button type="button" class="chip" data-preset="3m">Last 3 months</button>
+      </div>
+      <div class="row2 form"><label>From<input type="date" id="smsFrom"></label><label>To<input type="date" id="smsTo"></label></div>
+      <button class="btn primary" id="smsScan" style="margin-top:14px" disabled>Find expenses</button>
+    </section>
+
+    <section class="panel" id="smsResults" hidden>
+      <div class="panel-head"><h2>3. Review &amp; add</h2><button class="linkish" id="smsToggleAll">Select all</button></div>
+      <p class="small" id="smsStats"></p>
+      <div id="smsList"></div>
+      <div id="smsUnread"></div>
+    </section>
+
+    <section class="panel">
+      <details id="smsCustom">
+        <summary><span><b>Customise SMS reading</b><br><span class="muted small">Category rules, senders to skip, defaults</span></span></summary>
+        <div class="custom-body">
+          <div class="field-label">Category rules</div>
+          <p class="muted small" style="margin:0 0 10px">If a message mentions a keyword, it gets that category. Your own rules are checked first.</p>
+          <form class="add-row rule-add" id="ruleAddForm">
+            <input id="ruleKw" maxlength="60" placeholder="Keyword, e.g. swiggy" autocomplete="off">
+            <select id="ruleCat"></select>
+            <button class="btn ghost" type="submit">Add</button>
+          </form>
+          <input type="search" id="ruleSearch" placeholder="Search rules…" class="rule-search">
+          <div id="ruleGroups"></div>
+          <button class="btn ghost sm" id="ruleReset" type="button">Reset rules to defaults</button>
+
+          <div class="form sms-opts">
+            <label class="check"><input type="checkbox" id="smsLearn"> <span>Learn from my changes<br><span class="muted small">When you change a category while reviewing, remember it for that merchant.</span></span></label>
+            <label class="check"><input type="checkbox" id="smsSkipPersonal"> <span>Skip messages from personal phone numbers</span></label>
+            <label class="check"><input type="checkbox" id="smsAtm"> <span>Tick ATM cash withdrawals by default</span></label>
+            <div class="row2">
+              <label>Category when unsure<select id="smsDefCat"></select></label>
+              <label>Payment method when unsure<select id="smsDefMethod"></select></label>
+            </div>
+            <label>Skip messages containing (comma separated)<input id="smsIgnore" autocomplete="off" placeholder="refund, cashback"></label>
+            <label>Skip these senders (comma separated)<input id="smsSkipSenders" autocomplete="off" placeholder="e.g. PAYTMB, JIOPAY"></label>
+          </div>
+          <p class="muted small">Changes apply the next time you tap “Find expenses”.</p>
+        </div>
+      </details>
+    </section>
+  </section>
+</div>
+
+<div class="sms-bar" id="smsBar" hidden>
+  <span id="smsSel" class="small"></span>
+  <button class="btn primary" id="smsAdd">Add</button>
 </div>
 
 <button class="fab" id="fab" aria-label="Add">+</button>
